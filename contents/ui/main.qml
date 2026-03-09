@@ -28,6 +28,13 @@ PlasmoidItem {
     property var sessionResetTime: null
     property var weeklyResetTime: null
 
+    // Low power mode and slow polling state
+    property bool inLowPowerMode: false
+    property bool inSlowPollingMode: false
+    property int unchangedPollCount: 0
+    property real lastSessionUsage: -1
+    property real lastWeeklyUsage: -1
+
     readonly property string usageApiUrl: "https://api.anthropic.com/api/oauth/usage"
 
     // Data source for reading credentials file
@@ -105,8 +112,30 @@ PlasmoidItem {
                         var sevenDaySonnet = data.seven_day_sonnet || {}
                         var sevenDayOpus = data.seven_day_opus || {}
 
-                        root.sessionUsagePercent = fiveHour.utilization || 0
-                        root.weeklyUsagePercent = sevenDay.utilization || 0
+                        var newSessionUsage = fiveHour.utilization || 0
+                        var newWeeklyUsage = sevenDay.utilization || 0
+
+                        // Check if values have changed for slow polling logic
+                        if (Plasmoid.configuration.slowPollingEnabled) {
+                            if (root.lastSessionUsage === newSessionUsage && root.lastWeeklyUsage === newWeeklyUsage) {
+                                root.unchangedPollCount++
+                                if (root.unchangedPollCount >= Plasmoid.configuration.slowPollingThreshold && !root.inSlowPollingMode) {
+                                    root.inSlowPollingMode = true
+                                    console.log("Claude Usage: Entering slow polling mode after", root.unchangedPollCount, "unchanged polls")
+                                }
+                            } else {
+                                root.unchangedPollCount = 0
+                                if (root.inSlowPollingMode) {
+                                    root.inSlowPollingMode = false
+                                    console.log("Claude Usage: Exiting slow polling mode - values changed")
+                                }
+                            }
+                        }
+
+                        root.lastSessionUsage = newSessionUsage
+                        root.lastWeeklyUsage = newWeeklyUsage
+                        root.sessionUsagePercent = newSessionUsage
+                        root.weeklyUsagePercent = newWeeklyUsage
                         root.sonnetWeeklyPercent = sevenDaySonnet ? (sevenDaySonnet.utilization || 0) : 0
                         root.opusWeeklyPercent = sevenDayOpus ? (sevenDayOpus.utilization || 0) : 0
 
@@ -119,10 +148,21 @@ PlasmoidItem {
                             root.weeklyReset = Qt.formatDateTime(root.weeklyResetTime, "MMM d, hh:mm")
                         }
 
+                        // Check for low power mode (session at 100%)
+                        if (Plasmoid.configuration.lowPowerModeEnabled && newSessionUsage >= 100) {
+                            if (!root.inLowPowerMode) {
+                                root.inLowPowerMode = true
+                                console.log("Claude Usage: Entering low power mode - session at 100%")
+                            }
+                        } else if (root.inLowPowerMode) {
+                            root.inLowPowerMode = false
+                            console.log("Claude Usage: Exiting low power mode")
+                        }
+
                         root.lastUpdate = Qt.formatTime(new Date(), "hh:mm:ss")
                         root.errorMsg = ""
 
-                        console.log("Claude Usage: API success - session:", root.sessionUsagePercent, "weekly:", root.weeklyUsagePercent)
+                        console.log("Claude Usage: API success - session:", root.sessionUsagePercent, "weekly:", root.weeklyUsagePercent, "lowPower:", root.inLowPowerMode, "slowPoll:", root.inSlowPollingMode)
                     } catch (e) {
                         console.log("Claude Usage: JSON parse error:", e)
                         root.errorMsg = "Parse error"
@@ -141,6 +181,10 @@ PlasmoidItem {
     }
 
     function refresh() {
+        // Manual refresh exits low power and slow polling modes
+        root.inLowPowerMode = false
+        root.inSlowPollingMode = false
+        root.unchangedPollCount = 0
         loadCredentials()
     }
 
@@ -472,6 +516,24 @@ PlasmoidItem {
                 opacity: 0.3
             }
 
+            // Polling mode indicator
+            RowLayout {
+                Layout.fillWidth: true
+                visible: root.inLowPowerMode || root.inSlowPollingMode
+
+                Kirigami.Icon {
+                    Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                    Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                    source: root.inLowPowerMode ? "battery-low" : "speedometer"
+                }
+                PlasmaComponents.Label {
+                    text: root.inLowPowerMode ? i18n.tr("Low power mode - paused until session resets") : i18n.tr("Slow polling mode")
+                    font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                    color: Kirigami.Theme.disabledTextColor
+                    font.italic: true
+                }
+            }
+
             RowLayout {
                 Layout.fillWidth: true
                 PlasmaComponents.Label {
@@ -491,10 +553,30 @@ PlasmoidItem {
 
     Timer {
         id: refreshTimer
-        interval: (Plasmoid.configuration.refreshInterval || 1) * 60000
-        running: true
+        interval: {
+            if (root.inSlowPollingMode) {
+                return (Plasmoid.configuration.slowPollingInterval || 5) * 60000
+            }
+            return (Plasmoid.configuration.refreshInterval || 1) * 60000
+        }
+        running: !root.inLowPowerMode
         repeat: true
         onTriggered: loadCredentials()
+    }
+
+    // Timer to check if session reset time has passed (for low power mode)
+    Timer {
+        id: lowPowerResetTimer
+        interval: 60000  // Check every minute
+        running: root.inLowPowerMode && root.sessionResetTime !== null
+        repeat: true
+        onTriggered: {
+            if (root.sessionResetTime && new Date() >= root.sessionResetTime) {
+                console.log("Claude Usage: Session reset time reached, resuming polling")
+                root.inLowPowerMode = false
+                loadCredentials()
+            }
+        }
     }
 
     function getUsageColor(percent) {
@@ -530,5 +612,13 @@ PlasmoidItem {
 
     Plasmoid.icon: "claude-usage"
     toolTipMainText: i18n.tr("Claude Usage")
-    toolTipSubText: i18n.tr("Session (5hr)") + ": " + Math.round(root.sessionUsagePercent) + "% | " + i18n.tr("Weekly (7day)") + ": " + Math.round(root.weeklyUsagePercent) + "%"
+    toolTipSubText: {
+        var text = i18n.tr("Session (5hr)") + ": " + Math.round(root.sessionUsagePercent) + "% | " + i18n.tr("Weekly (7day)") + ": " + Math.round(root.weeklyUsagePercent) + "%"
+        if (root.inLowPowerMode) {
+            text += "\n" + i18n.tr("Low power mode (paused until reset)")
+        } else if (root.inSlowPollingMode) {
+            text += "\n" + i18n.tr("Slow polling mode")
+        }
+        return text
+    }
 }

@@ -14,6 +14,10 @@ KCM.SimpleKCM {
 
     property string cfg_language
     property int cfg_refreshInterval
+    property bool cfg_lowPowerModeEnabled
+    property bool cfg_slowPollingEnabled
+    property int cfg_slowPollingInterval
+    property int cfg_slowPollingThreshold
 
     // Translation helper
     Translations {
@@ -66,6 +70,69 @@ KCM.SimpleKCM {
 
             QQC2.Label {
                 text: tr("minutes")
+            }
+        }
+
+        Kirigami.Separator {
+            Kirigami.FormData.isSection: true
+            Kirigami.FormData.label: tr("Power Saving")
+        }
+
+        QQC2.CheckBox {
+            id: lowPowerCheckBox
+            Kirigami.FormData.label: tr("Low power mode:")
+            text: tr("Pause polling when session hits 100%")
+            checked: cfg_lowPowerModeEnabled
+            onCheckedChanged: cfg_lowPowerModeEnabled = checked
+        }
+
+        QQC2.CheckBox {
+            id: slowPollingCheckBox
+            Kirigami.FormData.label: tr("Slow polling:")
+            text: tr("Reduce poll frequency when usage unchanged")
+            checked: cfg_slowPollingEnabled
+            onCheckedChanged: cfg_slowPollingEnabled = checked
+        }
+
+        RowLayout {
+            Kirigami.FormData.label: tr("Slow poll interval:")
+            enabled: cfg_slowPollingEnabled
+
+            QQC2.SpinBox {
+                id: slowPollingSpinBox
+                from: 1
+                to: 999
+                stepSize: 1
+                value: cfg_slowPollingInterval
+
+                onValueChanged: {
+                    cfg_slowPollingInterval = value
+                }
+            }
+
+            QQC2.Label {
+                text: tr("minutes")
+            }
+        }
+
+        RowLayout {
+            Kirigami.FormData.label: tr("Unchanged polls threshold:")
+            enabled: cfg_slowPollingEnabled
+
+            QQC2.SpinBox {
+                id: thresholdSpinBox
+                from: 1
+                to: 99
+                stepSize: 1
+                value: cfg_slowPollingThreshold
+
+                onValueChanged: {
+                    cfg_slowPollingThreshold = value
+                }
+            }
+
+            QQC2.Label {
+                text: tr("consecutive polls")
             }
         }
     }

@@ -14,5 +14,21 @@
             <label>Refresh interval in minutes</label>
             <default>1</default>
         </entry>
+        <entry name="lowPowerModeEnabled" type="Bool">
+            <label>Enable low power mode when session hits 100%</label>
+            <default>true</default>
+        </entry>
+        <entry name="slowPollingEnabled" type="Bool">
+            <label>Enable slow polling when usage unchanged</label>
+            <default>false</default>
+        </entry>
+        <entry name="slowPollingInterval" type="Int">
+            <label>Slow polling interval in minutes</label>
+            <default>5</default>
+        </entry>
+        <entry name="slowPollingThreshold" type="Int">
+            <label>Number of unchanged polls before switching to slow polling</label>
+            <default>3</default>
+        </entry>
     </group>
 </kcfg>
