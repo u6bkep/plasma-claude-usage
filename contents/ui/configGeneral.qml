@@ -19,6 +19,15 @@ KCM.SimpleKCM {
     property bool cfg_slowPollingEnabled
     property int cfg_slowPollingInterval
     property int cfg_slowPollingThreshold
+    property string cfg_panelLayout
+    property bool cfg_showIcon
+    property string cfg_panelStyle
+    property bool cfg_showSession
+    property bool cfg_showWeekly
+    property bool cfg_showSonnet
+    property string cfg_baseUrl
+    property string cfg_apiKey
+    property double cfg_backgroundOpacity
 
     // Translation helper
     Translations {
@@ -92,6 +101,14 @@ KCM.SimpleKCM {
             }
         }
 
+        QQC2.Label {
+            visible: cfg_refreshInterval < 5
+            text: "⚠ " + tr("Values under 5 min may cause rate limiting")
+            color: Kirigami.Theme.negativeTextColor
+            font.italic: true
+            Layout.fillWidth: true
+        }
+
         Kirigami.Separator {
             Kirigami.FormData.isSection: true
             Kirigami.FormData.label: tr("Power Saving")
@@ -153,6 +170,108 @@ KCM.SimpleKCM {
             QQC2.Label {
                 text: tr("consecutive polls")
             }
+        }
+
+        Kirigami.Separator {
+            Kirigami.FormData.isSection: true
+            Kirigami.FormData.label: tr("Panel display")
+        }
+
+        QQC2.ComboBox {
+            Kirigami.FormData.label: tr("Layout:")
+            model: [tr("Horizontal"), tr("Vertical")]
+            currentIndex: cfg_panelLayout === "vertical" ? 1 : 0
+            onCurrentIndexChanged: cfg_panelLayout = currentIndex === 1 ? "vertical" : "horizontal"
+        }
+
+        QQC2.CheckBox {
+            Kirigami.FormData.label: tr("Icon:")
+            text: tr("Show Claude icon")
+            checked: cfg_showIcon
+            onCheckedChanged: cfg_showIcon = checked
+        }
+
+        QQC2.ComboBox {
+            Kirigami.FormData.label: tr("Style:")
+            model: [tr("Text"), tr("Circular"), tr("Bar")]
+            currentIndex: cfg_panelStyle === "circular" ? 1 : cfg_panelStyle === "bar" ? 2 : 0
+            onCurrentIndexChanged: {
+                var styles = ["text", "circular", "bar"]
+                cfg_panelStyle = styles[currentIndex]
+            }
+        }
+
+        QQC2.CheckBox {
+            Kirigami.FormData.label: tr("Show in panel:")
+            text: tr("Session (5hr)")
+            checked: cfg_showSession
+            onCheckedChanged: cfg_showSession = checked
+        }
+
+        QQC2.CheckBox {
+            text: tr("Weekly (7day)")
+            checked: cfg_showWeekly
+            onCheckedChanged: cfg_showWeekly = checked
+        }
+
+        QQC2.CheckBox {
+            text: tr("Sonnet")
+            checked: cfg_showSonnet
+            onCheckedChanged: cfg_showSonnet = checked
+        }
+
+        RowLayout {
+            Kirigami.FormData.label: tr("Background opacity (desktop):")
+
+            QQC2.Slider {
+                id: opacitySlider
+                from: 0.0
+                to: 1.0
+                stepSize: 0.05
+                value: cfg_backgroundOpacity
+                Layout.preferredWidth: Kirigami.Units.gridUnit * 10
+
+                onMoved: {
+                    cfg_backgroundOpacity = value
+                }
+            }
+
+            QQC2.Label {
+                text: Math.round(opacitySlider.value * 100) + "%"
+                Layout.preferredWidth: Kirigami.Units.gridUnit * 2
+            }
+        }
+
+        Kirigami.Separator {
+            Kirigami.FormData.isSection: true
+            Kirigami.FormData.label: tr("Custom API (optional)")
+        }
+
+        QQC2.TextField {
+            id: baseUrlField
+            Kirigami.FormData.label: tr("Base URL:")
+            placeholderText: "https://api.anthropic.com"
+            text: cfg_baseUrl
+            onTextChanged: cfg_baseUrl = text
+            Layout.fillWidth: true
+        }
+
+        QQC2.Label {
+            text: tr("Leave empty to use ~/.claude/.credentials.json (default)")
+            font.italic: true
+            opacity: 0.7
+            Layout.fillWidth: true
+        }
+
+        QQC2.TextField {
+            id: apiKeyField
+            Kirigami.FormData.label: tr("API key:")
+            placeholderText: "sk-ant-..."
+            text: cfg_apiKey
+            echoMode: TextInput.Password
+            enabled: cfg_baseUrl !== ""
+            onTextChanged: cfg_apiKey = text
+            Layout.fillWidth: true
         }
     }
 }

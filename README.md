@@ -14,8 +14,13 @@ A KDE Plasma 6 widget that displays your Claude Code usage statistics in the tas
   - Reset times for both limits
   - Per-model breakdown (Sonnet/Opus)
   - Your subscription plan badge
-- **Auto-refresh**: Updates every minute automatically
-- **Error Handling**: Clear messages when not logged in or token expired
+- **Configurable Refresh**: Default 5 min polling (adjustable in settings)
+- **Smart Rate Limit Handling**: Uses `retry-after` header, exponential backoff, and token watcher for automatic recovery
+- **Local Cache**: Remembers last data on restart (up to 24h)
+- **Stale Detection**: Widget dims when data is outdated
+- **Error Handling**: Clear messages when not logged in, token expired, or rate limited
+- **Custom API Support**: Optional proxy/gateway with custom base URL and API key
+- **15 Languages**: EN, HU, DE, FR, ES, IT, PT, RU, PL, NL, TR, JA, KO, ZH-CN, ZH-TW
 - **No Dependencies**: Pure QML, no Python or external tools required
 
 ## Requirements
@@ -42,7 +47,7 @@ kpackagetool6 -t Plasma/Applet -i claude-usage-widget.plasmoid
 ### From Source
 
 ```bash
-git clone https://github.com/anthropics/claude-usage-widget.git
+git clone https://github.com/izll/plasma-claude-usage.git
 cd claude-usage-widget
 kpackagetool6 -t Plasma/Applet -i .
 ```
@@ -53,16 +58,36 @@ kpackagetool6 -t Plasma/Applet -i .
 2. Add the widget to your panel
 3. Click the widget to see detailed usage statistics
 
+## Configuration
+
+Right-click the widget and select **Configure...** to open the settings.
+
+### Custom API Base URL (optional)
+
+By default the widget reads your OAuth credentials from `~/.claude/.credentials.json` and calls `https://api.anthropic.com` directly — no configuration needed.
+
+If you use a custom API proxy or gateway, you can override this:
+
+| Setting | Description |
+|---|---|
+| **Base URL** | Your proxy URL, e.g. `https://your-proxy.example.com` |
+| **API key** | Your `ANTHROPIC_API_KEY` |
+
+> **Note:** The widget calls `/api/oauth/usage`, not the standard `/v1/messages` endpoint. Use the root URL without any path suffix — e.g. `https://api.anthropic.com`, not `https://api.anthropic.com/v1`.
+
+When a base URL is configured, the widget authenticates with `x-api-key` instead of the OAuth token. Leave the Base URL field empty to go back to the default credentials file method.
+
 ## How It Works
 
-The widget reads your Claude Code OAuth credentials from `~/.claude/.credentials.json` and calls the Anthropic usage API directly. No data is stored or sent anywhere else.
+The widget calls the Anthropic usage API directly from QML. No data is stored or sent anywhere else.
 
 ### API Endpoint
 
 ```
 GET https://api.anthropic.com/api/oauth/usage
 Headers:
-  Authorization: Bearer <oauth-token>
+  Authorization: Bearer <oauth-token>   (default mode)
+  x-api-key: <api-key>                  (custom base URL mode)
   anthropic-beta: oauth-2025-04-20
 ```
 
@@ -81,6 +106,24 @@ Your OAuth token has expired. Run Claude Code again to refresh it:
 ```bash
 claude
 ```
+The widget also has an "Open Claude" button for this.
+
+### "Rate limited" error
+
+The API allows ~4 requests per 5-minute window. The widget handles this automatically:
+- Reads the `retry-after` header and waits the specified time
+- Falls back to exponential backoff (5/10/15 min)
+- Monitors for token refresh and recovers instantly
+
+To avoid rate limiting, keep the refresh interval at 5 minutes or higher.
+
+### "Invalid API key" error
+
+The API key in the widget settings is wrong or revoked. Open **Configure...** and update it.
+
+### "Endpoint not found — check base URL" error
+
+The base URL in the widget settings doesn't point to a valid API. Make sure you're using the root URL without `/v1`, e.g. `https://api.anthropic.com`.
 
 ### Widget shows 0%
 
@@ -92,9 +135,14 @@ claude
 ```
 claude-usage-widget/
 ├── metadata.json           # Widget metadata
+├── install.sh              # Installation script
 ├── contents/
+│   ├── config/
+│   │   └── main.xml        # Configuration schema
 │   ├── ui/
-│   │   └── main.qml        # Widget implementation
+│   │   ├── main.qml        # Widget implementation
+│   │   ├── configGeneral.qml # Settings UI
+│   │   └── Translations.qml # i18n (15 languages)
 │   └── icons/
 │       └── claude.svg      # Claude logo (orange)
 └── screenshots/            # Preview images
@@ -110,9 +158,55 @@ izll
 
 ## Version History
 
+### 1.3.6 (2026)
+- Vertical layout option for taller panels (thanks @nahall, issue #5)
+- Panel metrics can now be stacked vertically to save horizontal space
+
+### 1.3.5 (2026)
+- Widget picker now shows proper preview image (progress ring + Claude logo + USAGE)
+- About page shows correct icon via auto-install to system icon theme
+- New `contents/screenshot.png` for KPackage widget picker preview
+
+### 1.3.2 (2026)
+- Fix widget icon not showing in panel widget picker dialog
+
+### 1.3.1 (2026)
+- Configurable background opacity for desktop mode (thanks @Endle)
+- Background opacity only applies on desktop, panel keeps default Plasma theme
+- Default opacity set to 100% for consistent upgrade experience
+
+### 1.3.0 (2026)
+- Three panel display styles: Text (classic), Circular (ring charts), Bar (vertical bars)
+- Claude icon can be hidden in panel
+- Tooltip shows all enabled metrics
+
+### 1.2.5 (2026)
+- Configurable panel metrics: choose Session, Weekly, Sonnet independently
+- Sonnet weekly usage can now be displayed in the panel (off by default)
+
+### 1.2.1 (2026)
+- Remove false decimal precision from percentage displays (thanks @robinpie)
+
+### 1.2.0 (2026)
+- Smart rate limit handling with `retry-after` header support
+- Exponential backoff with automatic recovery
+- Token watcher: instantly recovers when Claude Code refreshes the token
+- Local data cache: shows last known values on restart (up to 24h)
+- Stale detection: widget dims when data is outdated
+- Default refresh interval changed to 5 min to prevent rate limiting
+- Rate limit warning in popup and settings for intervals under 5 min
+
+### 1.1.0 (2026)
+- Custom API base URL and API key support for proxy/gateway users
+- 429 rate limit handling with auto-retry
+- Token expired state with "Open Claude" button
+- Dynamic Claude Code version detection for User-Agent
+- All strings translated across 15 languages
+- Install script added
+
 ### 1.0.0 (2025)
 - Initial release
 - Session and weekly usage display
 - Per-model breakdown (Sonnet/Opus)
-- Auto-refresh every minute
+- Configurable refresh interval
 - Error handling for login issues
