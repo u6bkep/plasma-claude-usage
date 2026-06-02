@@ -13,6 +13,7 @@ KCM.SimpleKCM {
     id: configPage
 
     property string cfg_language
+    property string cfg_claudeBaseFolder
     property int cfg_refreshInterval
     property bool cfg_lowPowerModeEnabled
     property bool cfg_slowPollingEnabled
@@ -51,6 +52,24 @@ KCM.SimpleKCM {
             onActivated: index => {
                 cfg_language = languageValues[index]
             }
+        }
+
+        QQC2.TextField {
+            id: baseFolderField
+            Kirigami.FormData.label: tr("Claude base folder:")
+            Layout.fillWidth: true
+            Layout.minimumWidth: Kirigami.Units.gridUnit * 16
+            text: cfg_claudeBaseFolder
+            placeholderText: "$HOME/.claude"
+            onTextChanged: cfg_claudeBaseFolder = text
+        }
+
+        QQC2.Label {
+            Layout.fillWidth: true
+            text: tr("Folder containing .credentials.json (e.g. $HOME/.claude-work for a second account)")
+            font: Kirigami.Theme.smallFont
+            opacity: 0.7
+            wrapMode: Text.WordWrap
         }
 
         RowLayout {

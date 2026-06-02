@@ -88,8 +88,9 @@ PlasmoidItem {
     function loadCredentials() {
         root.isLoading = true
         root.errorMsg = ""
-        // Use $HOME environment variable
-        fileReader.connectSource("cat $HOME/.claude/.credentials.json 2>/dev/null")
+        // Base folder is configurable; default "$HOME/.claude". Shell expands $HOME/~.
+        var baseFolder = Plasmoid.configuration.claudeBaseFolder || "$HOME/.claude"
+        fileReader.connectSource("cat " + baseFolder + "/.credentials.json 2>/dev/null")
     }
 
     function fetchUsageFromApi() {
@@ -602,6 +603,15 @@ PlasmoidItem {
             return hours + i18n.tr("h") + " " + minutes + i18n.tr("m")
         } else {
             return minutes + i18n.tr("m")
+        }
+    }
+
+    // Reload immediately when the configured base folder changes
+    Connections {
+        target: Plasmoid.configuration
+        function onClaudeBaseFolderChanged() {
+            console.log("Claude Usage: Base folder changed, reloading")
+            refresh()
         }
     }
 
