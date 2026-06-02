@@ -1,8 +1,14 @@
 #!/bin/bash
+set -euo pipefail
 
 PLUGIN_ID="network.gecko.claudeusage"
 INSTALL_DIR="$HOME/.local/share/plasma/plasmoids/$PLUGIN_ID"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [ -d "$INSTALL_DIR" ]; then
+    echo "Removing previous install at $INSTALL_DIR..."
+    rm -rf "$INSTALL_DIR"
+fi
 
 echo "Installing Claude Usage widget..."
 
