@@ -19,10 +19,15 @@ PlasmoidItem {
     property real weeklyUsagePercent: 0
     property real sonnetWeeklyPercent: 0
     property real opusWeeklyPercent: 0
-    property string lastUpdate: ""
+    property double lastUpdateTime: 0
+    property bool lastUpdateFromCache: false
+    readonly property string lastUpdate: lastUpdateTime > 0
+        ? formatClockTime(new Date(lastUpdateTime), true) + (lastUpdateFromCache ? " *" : "")
+        : ""
     property string planName: ""
-    property string sessionReset: ""
-    property string weeklyReset: ""
+    readonly property bool use12HourFormat: Plasmoid.configuration.use12HourFormat === true
+    readonly property string sessionReset: sessionResetTime ? formatClockTime(sessionResetTime, false) : ""
+    readonly property string weeklyReset: weeklyResetTime ? formatResetDateTime(weeklyResetTime) : ""
     property string errorMsg: ""
     property string accessToken: ""
     property string apiKey: ""
@@ -84,12 +89,11 @@ PlasmoidItem {
                         root.hasSonnetData = cache.hasSonnet || false
                         root.hasOpusData = cache.hasOpus || false
                         root.planName = cache.plan || ""
-                        root.sessionReset = cache.sessionReset || ""
-                        root.weeklyReset = cache.weeklyReset || ""
                         root.sessionResetTime = cache.sessionResetTs ? new Date(cache.sessionResetTs) : null
                         root.weeklyResetTime = cache.weeklyResetTs ? new Date(cache.weeklyResetTs) : null
                         root.lastSuccessTime = cache.timestamp
-                        root.lastUpdate = Qt.formatTime(new Date(cache.timestamp), "hh:mm:ss") + " *"
+                        root.lastUpdateTime = cache.timestamp
+                        root.lastUpdateFromCache = true
                         root.isStale = age > root.staleThresholdMs
                         console.log("Claude Usage: Loaded cache, age:", Math.round(age/60000), "min, stale:", root.isStale)
                     } else {
@@ -111,8 +115,6 @@ PlasmoidItem {
             hasSonnet: root.hasSonnetData,
             hasOpus: root.hasOpusData,
             plan: root.planName,
-            sessionReset: root.sessionReset,
-            weeklyReset: root.weeklyReset,
             sessionResetTs: root.sessionResetTime ? root.sessionResetTime.getTime() : null,
             weeklyResetTs: root.weeklyResetTime ? root.weeklyResetTime.getTime() : null,
             timestamp: Date.now()
@@ -329,14 +331,13 @@ PlasmoidItem {
 
                         if (fiveHour.resets_at) {
                             root.sessionResetTime = new Date(fiveHour.resets_at)
-                            root.sessionReset = Qt.formatTime(root.sessionResetTime, "hh:mm")
                         }
                         if (sevenDay.resets_at) {
                             root.weeklyResetTime = new Date(sevenDay.resets_at)
-                            root.weeklyReset = Qt.formatDateTime(root.weeklyResetTime, "MMM d, hh:mm")
                         }
 
-                        root.lastUpdate = Qt.formatTime(new Date(), "hh:mm:ss")
+                        root.lastUpdateTime = Date.now()
+                        root.lastUpdateFromCache = false
                         root.lastSuccessTime = Date.now()
                         root.isStale = false
                         root.errorMsg = ""
@@ -1161,6 +1162,18 @@ PlasmoidItem {
         if (percent < 50) return Kirigami.Theme.positiveTextColor
         if (percent < 80) return Kirigami.Theme.neutralTextColor
         return Kirigami.Theme.negativeTextColor
+    }
+
+    // Format a clock time honoring the 12h/24h setting. withSeconds adds ss.
+    function formatClockTime(date, withSeconds) {
+        if (root.use12HourFormat)
+            return Qt.formatTime(date, withSeconds ? "h:mm:ss AP" : "h:mm AP")
+        return Qt.formatTime(date, withSeconds ? "hh:mm:ss" : "hh:mm")
+    }
+
+    // Format a date + clock time (used for the weekly reset) honoring the setting.
+    function formatResetDateTime(date) {
+        return Qt.formatDateTime(date, root.use12HourFormat ? "MMM d, h:mm AP" : "MMM d, hh:mm")
     }
 
     function formatTimeRemaining(resetTime) {

@@ -15,6 +15,7 @@ KCM.SimpleKCM {
     property string cfg_language
     property string cfg_claudeBaseFolder
     property int cfg_refreshInterval
+    property bool cfg_use12HourFormat
     property bool cfg_lowPowerModeEnabled
     property bool cfg_slowPollingEnabled
     property int cfg_slowPollingInterval
@@ -107,6 +108,13 @@ KCM.SimpleKCM {
             color: Kirigami.Theme.negativeTextColor
             font.italic: true
             Layout.fillWidth: true
+        }
+
+        QQC2.ComboBox {
+            Kirigami.FormData.label: tr("Time format:")
+            model: [tr("24-hour"), tr("12-hour (AM/PM)")]
+            currentIndex: cfg_use12HourFormat ? 1 : 0
+            onActivated: index => { cfg_use12HourFormat = index === 1 }
         }
 
         Kirigami.Separator {

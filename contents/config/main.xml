@@ -18,6 +18,10 @@
             <label>Refresh interval in minutes</label>
             <default>5</default>
         </entry>
+        <entry name="use12HourFormat" type="Bool">
+            <label>Use 12-hour (AM/PM) clock for times</label>
+            <default>false</default>
+        </entry>
         <entry name="panelLayout" type="String">
             <label>Panel layout direction (horizontal or vertical)</label>
             <default>horizontal</default>
