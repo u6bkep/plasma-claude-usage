@@ -42,8 +42,8 @@
             <label>Show weekly (7day) usage in panel</label>
             <default>true</default>
         </entry>
-        <entry name="showSonnet" type="Bool">
-            <label>Show Sonnet weekly usage in panel</label>
+        <entry name="showTopModel" type="Bool">
+            <label>Show top model weekly usage in panel</label>
             <default>false</default>
         </entry>
         <entry name="baseUrl" type="String">
