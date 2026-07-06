@@ -76,6 +76,19 @@ PlasmoidItem {
     // Configured Claude base folder (contains .credentials.json); shell expands $HOME/~
     readonly property string claudeBaseFolder: Plasmoid.configuration.claudeBaseFolder || "$HOME/.claude"
 
+    // Cache identity: one cache file per data source, so two widget instances
+    // pointed at different accounts don't overwrite each other's data. Keyed on
+    // the *configured* strings (base URL or credentials folder), never resolved
+    // paths — the user's Claude folders may symlink into each other internally
+    // (e.g. ~/.klaude/cache -> ~/.claude/cache), so resolving symlinks or writing
+    // the cache inside the Claude folder itself could merge two accounts again.
+    // The file lives in ~/.local/share, outside any Claude folder, for the same reason.
+    readonly property string cacheSourceId: {
+        var configuredUrl = (Plasmoid.configuration.baseUrl || "").trim()
+        return (configuredUrl ? configuredUrl : claudeBaseFolder).replace(/[^A-Za-z0-9._-]/g, "_")
+    }
+    readonly property string cacheFilePath: "$HOME/.local/share/claude-usage-cache-" + cacheSourceId + ".json"
+
     // Cache writer - saves last successful data to file
     Plasma5Support.DataSource {
         id: cacheWriter
@@ -130,7 +143,7 @@ PlasmoidItem {
             timestamp: Date.now()
         }
         var json = JSON.stringify(cache)
-        cacheWriter.connectSource("echo '" + json.replace(/'/g, "'\\''") + "' > $HOME/.local/share/claude-usage-cache.json")
+        cacheWriter.connectSource("echo '" + json.replace(/'/g, "'\\''") + "' > " + root.cacheFilePath)
     }
 
     // Stale checker - updates isStale flag periodically
@@ -1331,7 +1344,7 @@ PlasmoidItem {
         console.log("Claude Usage: Widget loaded")
         var iconSource = Qt.resolvedUrl("../icons/claude-usage-widget.svg").toString().replace("file://", "")
         iconInstaller.connectSource("bash -c 'ICON_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps && mkdir -p $ICON_DIR && cp \"" + iconSource + "\" $ICON_DIR/claude-usage-widget.svg && chmod 644 $ICON_DIR/claude-usage-widget.svg 2>/dev/null'")
-        cacheReader.connectSource("cat $HOME/.local/share/claude-usage-cache.json 2>/dev/null")
+        cacheReader.connectSource("cat " + root.cacheFilePath + " 2>/dev/null")
         loadCredentials()
     }
 
