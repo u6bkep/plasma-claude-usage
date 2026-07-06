@@ -31,6 +31,8 @@ QtObject {
             "Not logged in": "Not logged in",
             "Token expired": "Token expired",
             "API error": "API error",
+            "Service unavailable": "Service unavailable",
+            "Showing last known data": "Showing last known data",
             "Run 'claude' to log in": "Run 'claude' to log in",
             "No model breakdown available": "No model breakdown available",
             "Language:": "Language:",

@@ -51,6 +51,10 @@ PlasmoidItem {
     property var weeklyResetTime: null
     property bool hasTokenError: false
     property bool hasRateLimitError: false
+    // Transient server-side failure (5xx or network): keep showing cached data
+    property bool hasServerError: false
+    property int errorStatus: 0
+    property string errorDetail: ""  // actual error message returned by the endpoint
     property int rateLimitRetryCount: 0
     property int rateLimitRetryMs: 0  // from retry-after header
     property double lastFetchTime: 0
@@ -213,6 +217,7 @@ PlasmoidItem {
                         fetchUsageFromApi()
                     } else {
                         root.errorMsg = i18n.tr("Not logged in")
+                        root.errorDetail = ""
                         root.isLoading = false
                     }
                 } catch (e) {
@@ -223,6 +228,7 @@ PlasmoidItem {
             } else {
                 console.log("Claude Usage: No credentials file found")
                 root.errorMsg = "Not logged in"
+                root.errorDetail = ""
                 root.isLoading = false
             }
         }
@@ -258,6 +264,7 @@ PlasmoidItem {
                 fetchUsageFromApi()
             } else {
                 root.errorMsg = "API key not configured"
+                root.errorDetail = ""
                 root.isLoading = false
             }
         } else {
@@ -266,6 +273,21 @@ PlasmoidItem {
             console.log("Claude Usage: No base URL configured, reading credentials file from", root.claudeBaseFolder)
             fileReader.connectSource("cat " + root.claudeBaseFolder + "/.credentials.json 2>/dev/null")
         }
+    }
+
+    // Pull a human-readable message out of an error response. Anthropic API errors
+    // are JSON ({"error":{"message":...}}), but proxy-level failures arrive as plain
+    // text (e.g. 503 "upstream connect error ... reset reason: overflow").
+    function extractErrorDetail(xhr) {
+        var text = (xhr.responseText || "").trim()
+        if (!text) return ""
+        try {
+            var parsed = JSON.parse(text)
+            if (parsed.error && parsed.error.message) return parsed.error.message
+            if (parsed.message) return parsed.message
+        } catch (e) {}
+        text = text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim()
+        return text.length > 200 ? text.substring(0, 200) + "…" : text
     }
 
     function fetchUsageFromApi(force) {
@@ -298,6 +320,11 @@ PlasmoidItem {
         xhr.onreadystatechange = function() {
             if (xhr.readyState === XMLHttpRequest.DONE) {
                 root.isLoading = false
+
+                if (xhr.status !== 200) {
+                    root.errorStatus = xhr.status
+                    root.errorDetail = extractErrorDetail(xhr)
+                }
 
                 if (xhr.status === 200) {
                     try {
@@ -375,8 +402,11 @@ PlasmoidItem {
                         root.lastSuccessTime = Date.now()
                         root.isStale = false
                         root.errorMsg = ""
+                        root.errorDetail = ""
+                        root.errorStatus = 0
                         root.hasTokenError = false
                         root.hasRateLimitError = false
+                        root.hasServerError = false
                         root.rateLimitRetryCount = 0
                         root.rateLimitRetryMs = 0
 
@@ -401,6 +431,7 @@ PlasmoidItem {
                 } else if (xhr.status === 401) {
                     // Clear any stale rate-limit state so a prior 429 can't keep the retry timer firing
                     root.hasRateLimitError = false
+                    root.hasServerError = false
                     root.rateLimitRetryCount = 0
                     if (root.baseUrl) {
                         root.errorMsg = i18n.tr("Invalid API key")
@@ -416,9 +447,11 @@ PlasmoidItem {
                     console.log("Claude Usage: 403 Forbidden - token missing required scope")
                     root.hasTokenError = true
                     root.hasRateLimitError = false
+                    root.hasServerError = false
                     root.rateLimitRetryCount = 0
                     root.errorMsg = ""
                 } else if (xhr.status === 404) {
+                    root.hasServerError = false
                     root.errorMsg = root.baseUrl
                         ? i18n.tr("Endpoint not found")
                         : i18n.tr("API error") + " (404)"
@@ -431,11 +464,22 @@ PlasmoidItem {
                     root.rateLimitRetryCount++
                     console.log("Claude Usage: 429 Rate limited (retry #" + root.rateLimitRetryCount + ", retry-after: " + retryAfter + "s, waiting: " + root.rateLimitBackoffMs/1000 + "s)")
                     root.hasRateLimitError = true
+                    root.hasServerError = false
                     root.lastFetchTime = 0  // allow retry timer to work
                     root.errorMsg = ""
+                } else if (xhr.status >= 500 || xhr.status === 0) {
+                    // Transient server or network failure: keep showing the cached
+                    // values (dimmed) in the panel; the popup surfaces the endpoint's
+                    // own error message so outages are distinguishable from auth issues
+                    console.log("Claude Usage: Server error:", xhr.status, "-", root.errorDetail)
+                    root.hasServerError = true
+                    root.hasTokenError = false
+                    root.hasRateLimitError = false
+                    root.errorMsg = ""
                 } else {
+                    root.hasServerError = false
                     root.errorMsg = i18n.tr("API error") + " (" + xhr.status + ")"
-                    console.log("Claude Usage: API error:", xhr.status, xhr.statusText)
+                    console.log("Claude Usage: API error:", xhr.status, "-", root.errorDetail)
                 }
             }
         }
@@ -450,6 +494,9 @@ PlasmoidItem {
         root.unchangedPollCount = 0
         root.hasTokenError = false
         root.hasRateLimitError = false
+        root.hasServerError = false
+        root.errorDetail = ""
+        root.errorStatus = 0
         root.rateLimitRetryCount = 0
         root.rateLimitRetryMs = 0
         loadCredentials()
@@ -457,6 +504,10 @@ PlasmoidItem {
 
     // Compact representation (panel)
     readonly property bool isVerticalLayout: Plasmoid.configuration.panelLayout === "vertical"
+
+    // Panel items dim whenever the shown data may be out of date (any error state or stale cache)
+    readonly property real dataOpacity: (hasTokenError || hasRateLimitError || hasServerError) ? 0.5 : isStale ? 0.6 : 1.0
+    readonly property real separatorOpacity: dataOpacity * 0.5
 
     compactRepresentation: Item {
         Layout.minimumWidth: usageRow.implicitWidth + Kirigami.Units.largeSpacing * 2
@@ -490,13 +541,13 @@ PlasmoidItem {
                     source: Qt.resolvedUrl("../icons/claude.svg")
                 }
 
-                // Red dot for token/rate limit error
+                // Error indicator dot: red for token/rate limit, orange for transient server errors
                 Rectangle {
-                    visible: root.hasTokenError || root.hasRateLimitError
+                    visible: root.hasTokenError || root.hasRateLimitError || root.hasServerError
                     width: 8
                     height: 8
                     radius: 4
-                    color: Kirigami.Theme.negativeTextColor
+                    color: root.hasServerError ? Kirigami.Theme.neutralTextColor : Kirigami.Theme.negativeTextColor
                     anchors.right: parent.right
                     anchors.bottom: parent.bottom
                     anchors.rightMargin: -2
@@ -521,7 +572,7 @@ PlasmoidItem {
                 Layout.preferredHeight: 10
                 radius: 5
                 color: getUsageColor(root.sessionUsagePercent)
-                opacity: (root.hasTokenError || root.hasRateLimitError) ? 0.5 : root.isStale ? 0.6 : 1.0
+                opacity: root.dataOpacity
             }
 
             PlasmaComponents.Label {
@@ -529,14 +580,14 @@ PlasmoidItem {
                 text: Math.round(root.sessionUsagePercent) + "%"
                 font.pixelSize: Kirigami.Theme.defaultFont.pixelSize
                 font.bold: true
-                opacity: (root.hasTokenError || root.hasRateLimitError) ? 0.5 : root.isStale ? 0.6 : 1.0
+                opacity: root.dataOpacity
             }
 
             // Separator session-weekly (text)
             PlasmaComponents.Label {
                 visible: !root.isVerticalLayout && (!Plasmoid.configuration.panelStyle || Plasmoid.configuration.panelStyle === "text") && (Plasmoid.configuration.showSession !== false) && (Plasmoid.configuration.showWeekly !== false) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 text: "|"
-                opacity: (root.hasTokenError || root.hasRateLimitError) ? 0.25 : root.isStale ? 0.35 : 0.5
+                opacity: root.separatorOpacity
                 font.pixelSize: Kirigami.Theme.defaultFont.pixelSize
             }
 
@@ -547,7 +598,7 @@ PlasmoidItem {
                 Layout.preferredHeight: 10
                 radius: 5
                 color: getUsageColor(root.weeklyUsagePercent)
-                opacity: (root.hasTokenError || root.hasRateLimitError) ? 0.5 : root.isStale ? 0.6 : 1.0
+                opacity: root.dataOpacity
             }
 
             PlasmaComponents.Label {
@@ -555,14 +606,14 @@ PlasmoidItem {
                 text: Math.round(root.weeklyUsagePercent) + "%"
                 font.pixelSize: Kirigami.Theme.defaultFont.pixelSize
                 font.bold: true
-                opacity: (root.hasTokenError || root.hasRateLimitError) ? 0.5 : root.isStale ? 0.6 : 1.0
+                opacity: root.dataOpacity
             }
 
             // Separator before top model (text)
             PlasmaComponents.Label {
                 visible: !root.isVerticalLayout && (!Plasmoid.configuration.panelStyle || Plasmoid.configuration.panelStyle === "text") && (Plasmoid.configuration.showTopModel === true) && root.hasModelData && ((Plasmoid.configuration.showSession !== false) || (Plasmoid.configuration.showWeekly !== false)) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 text: "|"
-                opacity: (root.hasTokenError || root.hasRateLimitError) ? 0.25 : root.isStale ? 0.35 : 0.5
+                opacity: root.separatorOpacity
                 font.pixelSize: Kirigami.Theme.defaultFont.pixelSize
             }
 
@@ -573,7 +624,7 @@ PlasmoidItem {
                 Layout.preferredHeight: 10
                 radius: 5
                 color: getUsageColor(root.topModelPercent)
-                opacity: (root.hasTokenError || root.hasRateLimitError) ? 0.5 : root.isStale ? 0.6 : 1.0
+                opacity: root.dataOpacity
             }
 
             PlasmaComponents.Label {
@@ -581,7 +632,7 @@ PlasmoidItem {
                 text: Math.round(root.topModelPercent) + "%"
                 font.pixelSize: Kirigami.Theme.defaultFont.pixelSize
                 font.bold: true
-                opacity: (root.hasTokenError || root.hasRateLimitError) ? 0.5 : root.isStale ? 0.6 : 1.0
+                opacity: root.dataOpacity
             }
 
             // === CIRCULAR STYLE ===
@@ -591,7 +642,7 @@ PlasmoidItem {
                 visible: Plasmoid.configuration.panelStyle === "circular" && (Plasmoid.configuration.showSession !== false) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 Layout.preferredWidth: 28
                 Layout.preferredHeight: 28
-                opacity: (root.hasTokenError || root.hasRateLimitError) ? 0.5 : root.isStale ? 0.6 : 1.0
+                opacity: root.dataOpacity
 
                 Canvas {
                     anchors.fill: parent
@@ -617,7 +668,7 @@ PlasmoidItem {
                 visible: Plasmoid.configuration.panelStyle === "circular" && (Plasmoid.configuration.showWeekly !== false) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 Layout.preferredWidth: 28
                 Layout.preferredHeight: 28
-                opacity: (root.hasTokenError || root.hasRateLimitError) ? 0.5 : root.isStale ? 0.6 : 1.0
+                opacity: root.dataOpacity
 
                 Canvas {
                     anchors.fill: parent
@@ -643,7 +694,7 @@ PlasmoidItem {
                 visible: Plasmoid.configuration.panelStyle === "circular" && (Plasmoid.configuration.showTopModel === true) && root.hasModelData && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 Layout.preferredWidth: 28
                 Layout.preferredHeight: 28
-                opacity: (root.hasTokenError || root.hasRateLimitError) ? 0.5 : root.isStale ? 0.6 : 1.0
+                opacity: root.dataOpacity
 
                 Canvas {
                     anchors.fill: parent
@@ -671,7 +722,7 @@ PlasmoidItem {
                 visible: Plasmoid.configuration.panelStyle === "bar" && (Plasmoid.configuration.showSession !== false) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 Layout.preferredWidth: 32
                 Layout.preferredHeight: parent.height
-                opacity: (root.hasTokenError || root.hasRateLimitError) ? 0.5 : root.isStale ? 0.6 : 1.0
+                opacity: root.dataOpacity
 
                 Rectangle {
                     anchors.fill: parent
@@ -704,7 +755,7 @@ PlasmoidItem {
                 visible: Plasmoid.configuration.panelStyle === "bar" && (Plasmoid.configuration.showWeekly !== false) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 Layout.preferredWidth: 32
                 Layout.preferredHeight: parent.height
-                opacity: (root.hasTokenError || root.hasRateLimitError) ? 0.5 : root.isStale ? 0.6 : 1.0
+                opacity: root.dataOpacity
 
                 Rectangle {
                     anchors.fill: parent
@@ -737,7 +788,7 @@ PlasmoidItem {
                 visible: Plasmoid.configuration.panelStyle === "bar" && (Plasmoid.configuration.showTopModel === true) && root.hasModelData && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 Layout.preferredWidth: 32
                 Layout.preferredHeight: parent.height
-                opacity: (root.hasTokenError || root.hasRateLimitError) ? 0.5 : root.isStale ? 0.6 : 1.0
+                opacity: root.dataOpacity
 
                 Rectangle {
                     anchors.fill: parent
@@ -829,12 +880,19 @@ PlasmoidItem {
                         color: Kirigami.Theme.negativeTextColor
                         font.bold: true
                     }
+                    // Prefer the endpoint's own error message over a generic hint:
+                    // "upstream connect error... overflow" tells the user far more
+                    // than a canned suggestion to re-login would
                     PlasmaComponents.Label {
-                        text: root.baseUrl
-                            ? i18n.tr("Check base URL and API key in widget settings")
-                            : i18n.tr("Run 'claude' to log in")
+                        text: root.errorDetail !== ""
+                            ? root.errorDetail
+                            : (root.baseUrl
+                                ? i18n.tr("Check base URL and API key in widget settings")
+                                : i18n.tr("Run 'claude' to log in"))
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         color: Kirigami.Theme.negativeTextColor
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
                     }
                 }
             }
@@ -893,6 +951,42 @@ PlasmoidItem {
                         text: i18n.tr("Auto-retry in") + " " + Math.round(root.rateLimitBackoffMs / 60000) + " min"
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         color: Kirigami.Theme.negativeTextColor
+                    }
+                }
+            }
+
+            // Transient server/network error - cached data is still shown in the panel
+            Rectangle {
+                visible: root.hasServerError
+                Layout.fillWidth: true
+                Layout.preferredHeight: serverErrorColumn.implicitHeight + Kirigami.Units.largeSpacing
+                radius: 5
+                color: Kirigami.Theme.neutralBackgroundColor
+
+                ColumnLayout {
+                    id: serverErrorColumn
+                    anchors.fill: parent
+                    anchors.margins: Kirigami.Units.smallSpacing
+                    spacing: Kirigami.Units.smallSpacing
+
+                    PlasmaComponents.Label {
+                        text: "⚠ " + i18n.tr("Service unavailable") + (root.errorStatus > 0 ? " (" + root.errorStatus + ")" : "")
+                        color: Kirigami.Theme.neutralTextColor
+                        font.bold: true
+                    }
+                    PlasmaComponents.Label {
+                        visible: root.errorDetail !== ""
+                        text: root.errorDetail
+                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                        color: Kirigami.Theme.neutralTextColor
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                    PlasmaComponents.Label {
+                        text: i18n.tr("Showing last known data")
+                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                        color: Kirigami.Theme.disabledTextColor
+                        font.italic: true
                     }
                 }
             }
