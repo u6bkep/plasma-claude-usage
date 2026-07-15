@@ -13,7 +13,9 @@ KCM.SimpleKCM {
     id: configPage
 
     property string cfg_language
+    property string cfg_provider
     property string cfg_claudeBaseFolder
+    property string cfg_codexBaseFolder
     property int cfg_refreshInterval
     property bool cfg_use12HourFormat
     property bool cfg_lowPowerModeEnabled
@@ -64,8 +66,25 @@ KCM.SimpleKCM {
             }
         }
 
+        QQC2.ComboBox {
+            id: providerCombo
+            Kirigami.FormData.label: tr("Provider:")
+            model: ["Claude", "OpenAI Codex"]
+            currentIndex: cfg_provider === "codex" ? 1 : 0
+            onActivated: index => { cfg_provider = index === 1 ? "codex" : "claude" }
+        }
+
+        QQC2.Label {
+            Layout.fillWidth: true
+            text: tr("Each widget instance tracks one account. Add another instance for a second subscription.")
+            font: Kirigami.Theme.smallFont
+            opacity: 0.7
+            wrapMode: Text.WordWrap
+        }
+
         QQC2.TextField {
             id: baseFolderField
+            visible: cfg_provider !== "codex"
             Kirigami.FormData.label: tr("Claude base folder:")
             Layout.fillWidth: true
             Layout.minimumWidth: Kirigami.Units.gridUnit * 16
@@ -75,8 +94,29 @@ KCM.SimpleKCM {
         }
 
         QQC2.Label {
+            visible: cfg_provider !== "codex"
             Layout.fillWidth: true
             text: tr("Folder containing .credentials.json (e.g. $HOME/.claude-work for a second account)")
+            font: Kirigami.Theme.smallFont
+            opacity: 0.7
+            wrapMode: Text.WordWrap
+        }
+
+        QQC2.TextField {
+            id: codexFolderField
+            visible: cfg_provider === "codex"
+            Kirigami.FormData.label: tr("Codex base folder:")
+            Layout.fillWidth: true
+            Layout.minimumWidth: Kirigami.Units.gridUnit * 16
+            text: cfg_codexBaseFolder
+            placeholderText: "$HOME/.codex"
+            onTextChanged: cfg_codexBaseFolder = text
+        }
+
+        QQC2.Label {
+            visible: cfg_provider === "codex"
+            Layout.fillWidth: true
+            text: tr("Folder containing auth.json created by 'codex login'")
             font: Kirigami.Theme.smallFont
             opacity: 0.7
             wrapMode: Text.WordWrap
@@ -194,7 +234,7 @@ KCM.SimpleKCM {
 
         QQC2.CheckBox {
             Kirigami.FormData.label: tr("Icon:")
-            text: tr("Show Claude icon")
+            text: tr("Show provider icon")
             checked: cfg_showIcon
             onCheckedChanged: cfg_showIcon = checked
         }
@@ -223,6 +263,7 @@ KCM.SimpleKCM {
         }
 
         QQC2.CheckBox {
+            visible: cfg_provider !== "codex"
             text: tr("Top model")
             checked: cfg_showTopModel
             onCheckedChanged: cfg_showTopModel = checked
@@ -251,12 +292,14 @@ KCM.SimpleKCM {
         }
 
         Kirigami.Separator {
+            visible: cfg_provider !== "codex"
             Kirigami.FormData.isSection: true
             Kirigami.FormData.label: tr("Custom API (optional)")
         }
 
         QQC2.TextField {
             id: baseUrlField
+            visible: cfg_provider !== "codex"
             Kirigami.FormData.label: tr("Base URL:")
             placeholderText: "https://api.anthropic.com"
             text: cfg_baseUrl
@@ -265,6 +308,7 @@ KCM.SimpleKCM {
         }
 
         QQC2.Label {
+            visible: cfg_provider !== "codex"
             text: tr("Leave empty to use ~/.claude/.credentials.json (default)")
             font.italic: true
             opacity: 0.7
@@ -273,6 +317,7 @@ KCM.SimpleKCM {
 
         QQC2.TextField {
             id: apiKeyField
+            visible: cfg_provider !== "codex"
             Kirigami.FormData.label: tr("API key:")
             placeholderText: "sk-ant-..."
             text: cfg_apiKey

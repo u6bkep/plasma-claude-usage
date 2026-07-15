@@ -10,9 +10,17 @@
             <label>UI Language</label>
             <default>system</default>
         </entry>
+        <entry name="provider" type="String">
+            <label>Usage provider (claude or codex)</label>
+            <default>claude</default>
+        </entry>
         <entry name="claudeBaseFolder" type="String">
             <label>Claude base folder (contains .credentials.json)</label>
             <default>$HOME/.claude</default>
+        </entry>
+        <entry name="codexBaseFolder" type="String">
+            <label>Codex base folder (contains auth.json)</label>
+            <default>$HOME/.codex</default>
         </entry>
         <entry name="refreshInterval" type="Int">
             <label>Refresh interval in minutes</label>

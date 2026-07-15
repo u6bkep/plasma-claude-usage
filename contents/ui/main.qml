@@ -15,12 +15,37 @@ PlasmoidItem {
         currentLanguage: Plasmoid.configuration.language || "system"
     }
 
+    // Which service this instance tracks: "claude" (default) or "codex".
+    // One instance == one account/subscription (mirrors the multi-account model).
+    readonly property string provider: Plasmoid.configuration.provider || "claude"
+    readonly property bool isCodex: root.provider === "codex"
+
     property real sessionUsagePercent: 0
     property real weeklyUsagePercent: 0
+    // Whether the API actually reported each window. Claude always reports both;
+    // Codex may omit a window (e.g. no active 5h window), and we hide phantom 0% rings.
+    property bool sessionAvailable: true
+    property bool weeklyAvailable: true
+    // Window lengths in ms, used to draw the inner "time elapsed" ring. Prefer an
+    // API-provided length (Codex sends limit_window_seconds); otherwise derive from
+    // the window's group (session=5h, weekly=7d) — never hardcoded per-model.
+    readonly property double defaultSessionWindowMs: 5 * 3600 * 1000
+    readonly property double defaultWeeklyWindowMs: 7 * 24 * 3600 * 1000
+    property double sessionWindowMs: defaultSessionWindowMs
+    property double weeklyWindowMs: defaultWeeklyWindowMs
     // Per-model weekly usage, derived from the API's limits[] scoped entries.
-    // Each element: { name: string, percent: real, active: bool }. Dynamic, so
-    // new models (Fable, etc.) appear automatically with no code changes.
+    // Each element: { name: string, percent: real, active: bool, resetTs: number }.
+    // Dynamic, so new models (Fable, etc.) appear automatically with no code changes.
     property var modelUsages: []
+    // Claude extra-usage ("spend") pool that covers you past plan limits, or null when
+    // disabled. Shape: { usedMinor, limitMinor, exponent, currency, percent }.
+    property var spendInfo: null
+    // Codex credits, or null. Shape: { balance, unlimited, hasCredits, resetCredits,
+    // localMsg, cloudMsg }. resetCredits = banked rate-limit resets you can spend to
+    // reset a hit limit early; localMsg/cloudMsg = [low, high] approx messages remaining.
+    property var codexCredits: null
+    // Codex: true when the account is currently rate-limited (limit_reached / !allowed).
+    property bool codexBlocked: false
     readonly property bool hasModelData: root.modelUsages.length > 0
     // The single model most worth surfacing in the compact panel: highest utilization.
     readonly property var topModel: {
@@ -33,6 +58,8 @@ PlasmoidItem {
     }
     readonly property string topModelName: root.topModel ? root.topModel.name : ""
     readonly property real topModelPercent: root.topModel ? root.topModel.percent : 0
+    readonly property var topModelResetTime: (root.topModel && root.topModel.resetTs)
+        ? new Date(root.topModel.resetTs) : null
     property double lastUpdateTime: 0
     property bool lastUpdateFromCache: false
     readonly property string lastUpdate: lastUpdateTime > 0
@@ -44,8 +71,11 @@ PlasmoidItem {
     readonly property string weeklyReset: weeklyResetTime ? formatResetDateTime(weeklyResetTime) : ""
     property string errorMsg: ""
     property string accessToken: ""
+    property string codexAccountId: ""
     property string apiKey: ""
     property string baseUrl: ""
+    // Bumped every minute so the time-progress ring/marker repaints as the window elapses.
+    property int minuteTick: 0
     property bool isLoading: false
     property var sessionResetTime: null
     property var weeklyResetTime: null
@@ -75,6 +105,8 @@ PlasmoidItem {
 
     // Configured Claude base folder (contains .credentials.json); shell expands $HOME/~
     readonly property string claudeBaseFolder: Plasmoid.configuration.claudeBaseFolder || "$HOME/.claude"
+    // Configured Codex base folder (contains auth.json from `codex login`).
+    readonly property string codexBaseFolder: Plasmoid.configuration.codexBaseFolder || "$HOME/.codex"
 
     // Cache identity: one cache file per data source, so two widget instances
     // pointed at different accounts don't overwrite each other's data. Keyed on
@@ -84,8 +116,10 @@ PlasmoidItem {
     // the cache inside the Claude folder itself could merge two accounts again.
     // The file lives in ~/.local/share, outside any Claude folder, for the same reason.
     readonly property string cacheSourceId: {
+        if (root.isCodex)
+            return ("codex-" + codexBaseFolder).replace(/[^A-Za-z0-9._-]/g, "_")
         var configuredUrl = (Plasmoid.configuration.baseUrl || "").trim()
-        return (configuredUrl ? configuredUrl : claudeBaseFolder).replace(/[^A-Za-z0-9._-]/g, "_")
+        return ("claude-" + (configuredUrl ? configuredUrl : claudeBaseFolder)).replace(/[^A-Za-z0-9._-]/g, "_")
     }
     readonly property string cacheFilePath: "$HOME/.local/share/claude-usage-cache-" + cacheSourceId + ".json"
 
@@ -117,6 +151,13 @@ PlasmoidItem {
                         root.planName = cache.plan || ""
                         root.sessionResetTime = cache.sessionResetTs ? new Date(cache.sessionResetTs) : null
                         root.weeklyResetTime = cache.weeklyResetTs ? new Date(cache.weeklyResetTs) : null
+                        root.sessionWindowMs = cache.sessionWindowMs || root.defaultSessionWindowMs
+                        root.weeklyWindowMs = cache.weeklyWindowMs || root.defaultWeeklyWindowMs
+                        root.sessionAvailable = cache.sessionAvailable !== false
+                        root.weeklyAvailable = cache.weeklyAvailable !== false
+                        root.spendInfo = cache.spendInfo || null
+                        root.codexCredits = cache.codexCredits || null
+                        root.codexBlocked = cache.codexBlocked === true
                         root.lastSuccessTime = cache.timestamp
                         root.lastUpdateTime = cache.timestamp
                         root.lastUpdateFromCache = true
@@ -140,6 +181,13 @@ PlasmoidItem {
             plan: root.planName,
             sessionResetTs: root.sessionResetTime ? root.sessionResetTime.getTime() : null,
             weeklyResetTs: root.weeklyResetTime ? root.weeklyResetTime.getTime() : null,
+            sessionWindowMs: root.sessionWindowMs,
+            weeklyWindowMs: root.weeklyWindowMs,
+            sessionAvailable: root.sessionAvailable,
+            weeklyAvailable: root.weeklyAvailable,
+            spendInfo: root.spendInfo,
+            codexCredits: root.codexCredits,
+            codexBlocked: root.codexBlocked,
             timestamp: Date.now()
         }
         var json = JSON.stringify(cache)
@@ -156,6 +204,8 @@ PlasmoidItem {
             if (root.lastSuccessTime > 0) {
                 root.isStale = (Date.now() - root.lastSuccessTime) > root.staleThresholdMs
             }
+            // Advance the time-progress ring/marker (elapsed fraction grows each minute).
+            root.minuteTick++
         }
     }
 
@@ -171,7 +221,9 @@ PlasmoidItem {
             if (stdout.length > 10) {
                 try {
                     var creds = JSON.parse(stdout)
-                    var newToken = (creds.claudeAiOauth || {}).accessToken || ""
+                    var newToken = root.isCodex
+                        ? ((creds.tokens || {}).access_token || "")
+                        : ((creds.claudeAiOauth || {}).accessToken || "")
                     if (newToken && newToken !== root.accessToken) {
                         console.log("Claude Usage: New token detected! Resetting rate limit state.")
                         root.accessToken = newToken
@@ -193,7 +245,9 @@ PlasmoidItem {
         running: root.hasRateLimitError && !root.baseUrl
         repeat: true
         onTriggered: {
-            tokenWatcher.connectSource("cat " + root.claudeBaseFolder + "/.credentials.json 2>/dev/null")
+            tokenWatcher.connectSource(root.isCodex
+                ? "cat " + root.codexBaseFolder + "/auth.json 2>/dev/null"
+                : "cat " + root.claudeBaseFolder + "/.credentials.json 2>/dev/null")
         }
     }
 
@@ -208,6 +262,36 @@ PlasmoidItem {
             disconnectSource(sourceName)
 
             console.log("Claude Usage: Got credentials, length:", stdout.length)
+
+            // Codex: read tokens.access_token / tokens.account_id from auth.json.
+            if (root.isCodex) {
+                if (stdout.length > 10) {
+                    try {
+                        var cx = JSON.parse(stdout)
+                        var tokens = cx.tokens || {}
+                        root.accessToken = tokens.access_token || ""
+                        root.codexAccountId = tokens.account_id || ""
+                        console.log("Claude Usage: Codex token found, account:", root.codexAccountId ? "yes" : "no")
+                        if (root.accessToken) {
+                            fetchUsageFromApi()
+                        } else {
+                            root.errorMsg = i18n.tr("Not logged in")
+                            root.errorDetail = ""
+                            root.isLoading = false
+                        }
+                    } catch (e) {
+                        console.log("Claude Usage: Failed to parse Codex auth.json:", e)
+                        root.errorMsg = i18n.tr("Not logged in")
+                        root.isLoading = false
+                    }
+                } else {
+                    console.log("Claude Usage: No Codex auth.json found")
+                    root.errorMsg = i18n.tr("Not logged in")
+                    root.errorDetail = ""
+                    root.isLoading = false
+                }
+                return
+            }
 
             if (stdout.length > 10) {
                 try {
@@ -267,6 +351,15 @@ PlasmoidItem {
     function loadCredentials() {
         root.isLoading = true
         root.errorMsg = ""
+
+        if (root.isCodex) {
+            root.baseUrl = ""
+            root.apiKey = ""
+            console.log("Claude Usage: Codex mode, reading auth.json from", root.codexBaseFolder)
+            fileReader.connectSource("cat " + root.codexBaseFolder + "/auth.json 2>/dev/null")
+            return
+        }
+
         var configBaseUrl = (Plasmoid.configuration.baseUrl || "").trim()
         if (configBaseUrl) {
             root.baseUrl = configBaseUrl.replace(/\/$/, "")
@@ -312,22 +405,30 @@ PlasmoidItem {
         }
         root.lastFetchTime = now
 
-        var url = root.baseUrl
-            ? root.baseUrl + "/api/oauth/usage"
-            : "https://api.anthropic.com/api/oauth/usage"
+        var url = root.isCodex
+            ? "https://chatgpt.com/backend-api/wham/usage"
+            : (root.baseUrl
+                ? root.baseUrl + "/api/oauth/usage"
+                : "https://api.anthropic.com/api/oauth/usage")
 
         var xhr = new XMLHttpRequest()
         xhr.open("GET", url)
         xhr.setRequestHeader("Content-Type", "application/json")
         xhr.setRequestHeader("User-Agent", root.userAgent)
-        xhr.setRequestHeader("anthropic-beta", "oauth-2025-04-20")
 
-        if (root.baseUrl) {
-            // Custom base URL: authenticate with API key
-            xhr.setRequestHeader("x-api-key", root.apiKey)
-        } else {
-            // Default: OAuth token from credentials file
+        if (root.isCodex) {
+            // Codex/ChatGPT backend: bearer token + account id from auth.json
             xhr.setRequestHeader("Authorization", "Bearer " + root.accessToken)
+            xhr.setRequestHeader("ChatGPT-Account-Id", root.codexAccountId)
+        } else {
+            xhr.setRequestHeader("anthropic-beta", "oauth-2025-04-20")
+            if (root.baseUrl) {
+                // Custom base URL: authenticate with API key
+                xhr.setRequestHeader("x-api-key", root.apiKey)
+            } else {
+                // Default: OAuth token from credentials file
+                xhr.setRequestHeader("Authorization", "Bearer " + root.accessToken)
+            }
         }
 
         xhr.onreadystatechange = function() {
@@ -343,41 +444,121 @@ PlasmoidItem {
                     try {
                         var data = JSON.parse(xhr.responseText)
 
-                        var fiveHour = data.five_hour || {}
-                        var sevenDay = data.seven_day || {}
-
-                        var newSessionUsage = fiveHour.utilization || 0
-                        var newWeeklyUsage = sevenDay.utilization || 0
-                        var sessionResetSrc = fiveHour.resets_at
-                        var weeklyResetSrc = sevenDay.resets_at
+                        var newSessionUsage = 0
+                        var newWeeklyUsage = 0
+                        var sessionResetSrc = null   // ISO string (Claude) or ms number (Codex)
+                        var weeklyResetSrc = null
                         var models = []
+                        // Window lengths default to the group defaults; the API can override.
+                        var newSessionWindowMs = root.defaultSessionWindowMs
+                        var newWeeklyWindowMs = root.defaultWeeklyWindowMs
+                        var newSessionAvail = true
+                        var newWeeklyAvail = true
 
-                        // The limits[] array (new API) is the structured, self-describing source:
-                        // it enumerates the session limit, the weekly total, and one scoped entry
-                        // per model, so we don't hardcode model names. Fall back to the legacy
-                        // top-level keys for older Claude installs that don't return limits[].
-                        if (data.limits && data.limits.length > 0) {
-                            for (var li = 0; li < data.limits.length; li++) {
-                                var lim = data.limits[li]
-                                if (lim.kind === "session") {
-                                    newSessionUsage = lim.percent || 0
-                                    if (lim.resets_at) sessionResetSrc = lim.resets_at
-                                } else if (lim.kind === "weekly_all") {
-                                    newWeeklyUsage = lim.percent || 0
-                                    if (lim.resets_at) weeklyResetSrc = lim.resets_at
-                                } else if (lim.kind === "weekly_scoped" && lim.scope && lim.scope.model && lim.scope.model.display_name) {
-                                    models.push({
-                                        name: lim.scope.model.display_name,
-                                        percent: lim.percent || 0,
-                                        active: lim.is_active === true
-                                    })
+                        if (root.isCodex) {
+                            // Codex reports rate_limit.{primary,secondary}_window, each self-
+                            // describing with limit_window_seconds. Names aren't reliable
+                            // (primary can be the weekly window), so classify by length.
+                            var rl = data.rate_limit || {}
+                            var wins = []
+                            if (rl.primary_window) wins.push(rl.primary_window)
+                            if (rl.secondary_window) wins.push(rl.secondary_window)
+                            if (data.additional_rate_limits)
+                                for (var ai = 0; ai < data.additional_rate_limits.length; ai++)
+                                    if (data.additional_rate_limits[ai]) wins.push(data.additional_rate_limits[ai])
+
+                            newSessionAvail = false
+                            newWeeklyAvail = false
+                            for (var wi = 0; wi < wins.length; wi++) {
+                                var w = wins[wi]
+                                var lenSec = w.limit_window_seconds || 0
+                                var resetMs = w.reset_at
+                                    ? w.reset_at * 1000
+                                    : (w.reset_after_seconds ? Date.now() + w.reset_after_seconds * 1000 : null)
+                                var pct = w.used_percent || 0
+                                if (lenSec > 0 && lenSec <= 6 * 3600) {
+                                    newSessionUsage = pct
+                                    newSessionAvail = true
+                                    newSessionWindowMs = lenSec * 1000
+                                    if (resetMs) sessionResetSrc = resetMs
+                                } else if (lenSec > 0) {
+                                    newWeeklyUsage = pct
+                                    newWeeklyAvail = true
+                                    newWeeklyWindowMs = lenSec * 1000
+                                    if (resetMs) weeklyResetSrc = resetMs
                                 }
                             }
+                            root.planName = codexPlanName(data.plan_type)
+
+                            // Credits + banked rate-limit resets.
+                            var cr = data.credits || {}
+                            var resetCredits = (data.rate_limit_reset_credits || {}).available_count || 0
+                            var balanceNum = cr.balance !== undefined && cr.balance !== null
+                                ? parseFloat(cr.balance) : null
+                            root.codexCredits = {
+                                balance: (balanceNum !== null && !isNaN(balanceNum)) ? balanceNum : null,
+                                unlimited: cr.unlimited === true,
+                                hasCredits: cr.has_credits === true,
+                                resetCredits: resetCredits,
+                                localMsg: Array.isArray(cr.approx_local_messages) ? cr.approx_local_messages : null,
+                                cloudMsg: Array.isArray(cr.approx_cloud_messages) ? cr.approx_cloud_messages : null
+                            }
+                            root.codexBlocked = !!(rl.limit_reached === true || rl.allowed === false)
+                            root.spendInfo = null
                         } else {
-                            if (data.seven_day_sonnet)
-                                models.push({ name: i18n.tr("Sonnet"), percent: data.seven_day_sonnet.utilization || 0, active: false })
-                            if (data.seven_day_opus)
-                                models.push({ name: i18n.tr("Opus"), percent: data.seven_day_opus.utilization || 0, active: false })
+                            var fiveHour = data.five_hour || {}
+                            var sevenDay = data.seven_day || {}
+                            newSessionUsage = fiveHour.utilization || 0
+                            newWeeklyUsage = sevenDay.utilization || 0
+                            sessionResetSrc = fiveHour.resets_at
+                            weeklyResetSrc = sevenDay.resets_at
+                            var legacyModelReset = sevenDay.resets_at ? new Date(sevenDay.resets_at).getTime() : null
+
+                            // The limits[] array (new API) is the structured, self-describing source:
+                            // it enumerates the session limit, the weekly total, and one scoped entry
+                            // per model, so we don't hardcode model names. Claude gives no window
+                            // length, so lengths stay at the group defaults (session=5h, weekly=7d).
+                            // Fall back to the legacy top-level keys for older installs.
+                            if (data.limits && data.limits.length > 0) {
+                                for (var li = 0; li < data.limits.length; li++) {
+                                    var lim = data.limits[li]
+                                    if (lim.kind === "session") {
+                                        newSessionUsage = lim.percent || 0
+                                        if (lim.resets_at) sessionResetSrc = lim.resets_at
+                                    } else if (lim.kind === "weekly_all") {
+                                        newWeeklyUsage = lim.percent || 0
+                                        if (lim.resets_at) weeklyResetSrc = lim.resets_at
+                                    } else if (lim.kind === "weekly_scoped" && lim.scope && lim.scope.model && lim.scope.model.display_name) {
+                                        models.push({
+                                            name: lim.scope.model.display_name,
+                                            percent: lim.percent || 0,
+                                            active: lim.is_active === true,
+                                            resetTs: lim.resets_at ? new Date(lim.resets_at).getTime() : legacyModelReset
+                                        })
+                                    }
+                                }
+                            } else {
+                                if (data.seven_day_sonnet)
+                                    models.push({ name: i18n.tr("Sonnet"), percent: data.seven_day_sonnet.utilization || 0, active: false, resetTs: legacyModelReset })
+                                if (data.seven_day_opus)
+                                    models.push({ name: i18n.tr("Opus"), percent: data.seven_day_opus.utilization || 0, active: false, resetTs: legacyModelReset })
+                            }
+
+                            // Extra-usage ("spend") pool: dollars that cover you past plan limits.
+                            var sp = data.spend || {}
+                            if (sp.enabled === true && sp.limit && sp.limit.amount_minor !== undefined) {
+                                root.spendInfo = {
+                                    usedMinor: (sp.used && sp.used.amount_minor) || 0,
+                                    limitMinor: sp.limit.amount_minor || 0,
+                                    exponent: sp.limit.exponent !== undefined ? sp.limit.exponent : 2,
+                                    currency: sp.limit.currency || "USD",
+                                    percent: sp.percent || 0
+                                }
+                            } else {
+                                root.spendInfo = null
+                            }
+                            root.codexCredits = null
+                            root.codexBlocked = false
                         }
 
                         // Slow polling: count consecutive unchanged polls
@@ -402,12 +583,20 @@ PlasmoidItem {
                         root.sessionUsagePercent = newSessionUsage
                         root.weeklyUsagePercent = newWeeklyUsage
                         root.modelUsages = models
+                        root.sessionWindowMs = newSessionWindowMs
+                        root.weeklyWindowMs = newWeeklyWindowMs
+                        root.sessionAvailable = newSessionAvail
+                        root.weeklyAvailable = newWeeklyAvail
 
                         if (sessionResetSrc) {
                             root.sessionResetTime = new Date(sessionResetSrc)
+                        } else if (!newSessionAvail) {
+                            root.sessionResetTime = null
                         }
                         if (weeklyResetSrc) {
                             root.weeklyResetTime = new Date(weeklyResetSrc)
+                        } else if (!newWeeklyAvail) {
+                            root.weeklyResetTime = null
                         }
 
                         root.lastUpdateTime = Date.now()
@@ -551,7 +740,7 @@ PlasmoidItem {
 
                 Kirigami.Icon {
                     anchors.fill: parent
-                    source: Qt.resolvedUrl("../icons/claude.svg")
+                    source: Qt.resolvedUrl(root.isCodex ? "../icons/openai.svg" : "../icons/claude.svg")
                 }
 
                 // Error indicator dot: red for token/rate limit, orange for transient server errors
@@ -580,7 +769,7 @@ PlasmoidItem {
 
             // Session usage (text)
             Rectangle {
-                visible: (!Plasmoid.configuration.panelStyle || Plasmoid.configuration.panelStyle === "text") && (Plasmoid.configuration.showSession !== false) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
+                visible: (!Plasmoid.configuration.panelStyle || Plasmoid.configuration.panelStyle === "text") && (Plasmoid.configuration.showSession !== false) && root.sessionAvailable && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 Layout.preferredWidth: 10
                 Layout.preferredHeight: 10
                 radius: 5
@@ -589,7 +778,7 @@ PlasmoidItem {
             }
 
             PlasmaComponents.Label {
-                visible: (!Plasmoid.configuration.panelStyle || Plasmoid.configuration.panelStyle === "text") && (Plasmoid.configuration.showSession !== false) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
+                visible: (!Plasmoid.configuration.panelStyle || Plasmoid.configuration.panelStyle === "text") && (Plasmoid.configuration.showSession !== false) && root.sessionAvailable && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 text: Math.round(root.sessionUsagePercent) + "%"
                 font.pixelSize: Kirigami.Theme.defaultFont.pixelSize
                 font.bold: true
@@ -598,7 +787,7 @@ PlasmoidItem {
 
             // Separator session-weekly (text)
             PlasmaComponents.Label {
-                visible: !root.isVerticalLayout && (!Plasmoid.configuration.panelStyle || Plasmoid.configuration.panelStyle === "text") && (Plasmoid.configuration.showSession !== false) && (Plasmoid.configuration.showWeekly !== false) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
+                visible: !root.isVerticalLayout && (!Plasmoid.configuration.panelStyle || Plasmoid.configuration.panelStyle === "text") && (Plasmoid.configuration.showSession !== false) && root.sessionAvailable && (Plasmoid.configuration.showWeekly !== false) && root.weeklyAvailable && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 text: "|"
                 opacity: root.separatorOpacity
                 font.pixelSize: Kirigami.Theme.defaultFont.pixelSize
@@ -606,7 +795,7 @@ PlasmoidItem {
 
             // Weekly usage (text)
             Rectangle {
-                visible: (!Plasmoid.configuration.panelStyle || Plasmoid.configuration.panelStyle === "text") && (Plasmoid.configuration.showWeekly !== false) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
+                visible: (!Plasmoid.configuration.panelStyle || Plasmoid.configuration.panelStyle === "text") && (Plasmoid.configuration.showWeekly !== false) && root.weeklyAvailable && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 Layout.preferredWidth: 10
                 Layout.preferredHeight: 10
                 radius: 5
@@ -615,7 +804,7 @@ PlasmoidItem {
             }
 
             PlasmaComponents.Label {
-                visible: (!Plasmoid.configuration.panelStyle || Plasmoid.configuration.panelStyle === "text") && (Plasmoid.configuration.showWeekly !== false) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
+                visible: (!Plasmoid.configuration.panelStyle || Plasmoid.configuration.panelStyle === "text") && (Plasmoid.configuration.showWeekly !== false) && root.weeklyAvailable && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 text: Math.round(root.weeklyUsagePercent) + "%"
                 font.pixelSize: Kirigami.Theme.defaultFont.pixelSize
                 font.bold: true
@@ -652,7 +841,7 @@ PlasmoidItem {
 
             // Session (circular)
             Item {
-                visible: Plasmoid.configuration.panelStyle === "circular" && (Plasmoid.configuration.showSession !== false) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
+                visible: Plasmoid.configuration.panelStyle === "circular" && (Plasmoid.configuration.showSession !== false) && root.sessionAvailable && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 Layout.preferredWidth: 28
                 Layout.preferredHeight: 28
                 opacity: root.dataOpacity
@@ -661,10 +850,13 @@ PlasmoidItem {
                     anchors.fill: parent
                     onPaint: {
                         var ctx = getContext("2d")
-                        drawCircularProgress(ctx, width, height, root.sessionUsagePercent)
+                        drawCircularProgress(ctx, width, height, root.sessionUsagePercent,
+                            timeElapsedPercent(root.sessionResetTime, root.sessionWindowMs))
                     }
                     property real _percent: root.sessionUsagePercent
+                    property int _tick: root.minuteTick
                     on_PercentChanged: requestPaint()
+                    on_TickChanged: requestPaint()
                     Component.onCompleted: requestPaint()
                 }
 
@@ -678,7 +870,7 @@ PlasmoidItem {
 
             // Weekly (circular)
             Item {
-                visible: Plasmoid.configuration.panelStyle === "circular" && (Plasmoid.configuration.showWeekly !== false) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
+                visible: Plasmoid.configuration.panelStyle === "circular" && (Plasmoid.configuration.showWeekly !== false) && root.weeklyAvailable && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 Layout.preferredWidth: 28
                 Layout.preferredHeight: 28
                 opacity: root.dataOpacity
@@ -687,10 +879,13 @@ PlasmoidItem {
                     anchors.fill: parent
                     onPaint: {
                         var ctx = getContext("2d")
-                        drawCircularProgress(ctx, width, height, root.weeklyUsagePercent)
+                        drawCircularProgress(ctx, width, height, root.weeklyUsagePercent,
+                            timeElapsedPercent(root.weeklyResetTime, root.weeklyWindowMs))
                     }
                     property real _percent: root.weeklyUsagePercent
+                    property int _tick: root.minuteTick
                     on_PercentChanged: requestPaint()
+                    on_TickChanged: requestPaint()
                     Component.onCompleted: requestPaint()
                 }
 
@@ -713,10 +908,13 @@ PlasmoidItem {
                     anchors.fill: parent
                     onPaint: {
                         var ctx = getContext("2d")
-                        drawCircularProgress(ctx, width, height, root.topModelPercent)
+                        drawCircularProgress(ctx, width, height, root.topModelPercent,
+                            timeElapsedPercent(root.topModelResetTime, root.weeklyWindowMs))
                     }
                     property real _percent: root.topModelPercent
+                    property int _tick: root.minuteTick
                     on_PercentChanged: requestPaint()
+                    on_TickChanged: requestPaint()
                     Component.onCompleted: requestPaint()
                 }
 
@@ -732,7 +930,7 @@ PlasmoidItem {
 
             // Session (bar)
             Item {
-                visible: Plasmoid.configuration.panelStyle === "bar" && (Plasmoid.configuration.showSession !== false) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
+                visible: Plasmoid.configuration.panelStyle === "bar" && (Plasmoid.configuration.showSession !== false) && root.sessionAvailable && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 Layout.preferredWidth: 32
                 Layout.preferredHeight: parent.height
                 opacity: root.dataOpacity
@@ -753,6 +951,23 @@ PlasmoidItem {
                         radius: 2
                         color: getUsageColor(root.sessionUsagePercent)
                     }
+
+                    // Time-elapsed marker (how far through the window)
+                    Rectangle {
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.leftMargin: 1
+                        anchors.rightMargin: 1
+                        height: 2
+                        color: Kirigami.Theme.highlightColor
+                        visible: timeElapsedPercent(root.sessionResetTime, root.sessionWindowMs) >= 0
+                        y: {
+                            root.minuteTick  // re-evaluate each minute
+                            var t = timeElapsedPercent(root.sessionResetTime, root.sessionWindowMs)
+                            if (t < 0) return 0
+                            return 1 + (parent.height - 2) * (1 - Math.min(t, 100) / 100)
+                        }
+                    }
                 }
 
                 PlasmaComponents.Label {
@@ -765,7 +980,7 @@ PlasmoidItem {
 
             // Weekly (bar)
             Item {
-                visible: Plasmoid.configuration.panelStyle === "bar" && (Plasmoid.configuration.showWeekly !== false) && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
+                visible: Plasmoid.configuration.panelStyle === "bar" && (Plasmoid.configuration.showWeekly !== false) && root.weeklyAvailable && (root.errorMsg === "" || root.hasTokenError || root.hasRateLimitError)
                 Layout.preferredWidth: 32
                 Layout.preferredHeight: parent.height
                 opacity: root.dataOpacity
@@ -785,6 +1000,23 @@ PlasmoidItem {
                         height: Math.max((parent.height - 2) * Math.min(root.weeklyUsagePercent / 100, 1), 1)
                         radius: 2
                         color: getUsageColor(root.weeklyUsagePercent)
+                    }
+
+                    // Time-elapsed marker (how far through the window)
+                    Rectangle {
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.leftMargin: 1
+                        anchors.rightMargin: 1
+                        height: 2
+                        color: Kirigami.Theme.highlightColor
+                        visible: timeElapsedPercent(root.weeklyResetTime, root.weeklyWindowMs) >= 0
+                        y: {
+                            root.minuteTick  // re-evaluate each minute
+                            var t = timeElapsedPercent(root.weeklyResetTime, root.weeklyWindowMs)
+                            if (t < 0) return 0
+                            return 1 + (parent.height - 2) * (1 - Math.min(t, 100) / 100)
+                        }
                     }
                 }
 
@@ -818,6 +1050,23 @@ PlasmoidItem {
                         height: Math.max((parent.height - 2) * Math.min(root.topModelPercent / 100, 1), 1)
                         radius: 2
                         color: getUsageColor(root.topModelPercent)
+                    }
+
+                    // Time-elapsed marker (how far through the window)
+                    Rectangle {
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.leftMargin: 1
+                        anchors.rightMargin: 1
+                        height: 2
+                        color: Kirigami.Theme.highlightColor
+                        visible: timeElapsedPercent(root.topModelResetTime, root.weeklyWindowMs) >= 0
+                        y: {
+                            root.minuteTick  // re-evaluate each minute
+                            var t = timeElapsedPercent(root.topModelResetTime, root.weeklyWindowMs)
+                            if (t < 0) return 0
+                            return 1 + (parent.height - 2) * (1 - Math.min(t, 100) / 100)
+                        }
                     }
                 }
 
@@ -855,7 +1104,7 @@ PlasmoidItem {
             RowLayout {
                 Layout.fillWidth: true
                 PlasmaComponents.Label {
-                    text: i18n.tr("Claude Usage")
+                    text: root.isCodex ? i18n.tr("Codex Usage") : i18n.tr("Claude Usage")
                     font.bold: true
                     font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 1.3
                 }
@@ -899,9 +1148,11 @@ PlasmoidItem {
                     PlasmaComponents.Label {
                         text: root.errorDetail !== ""
                             ? root.errorDetail
-                            : (root.baseUrl
-                                ? i18n.tr("Check base URL and API key in widget settings")
-                                : i18n.tr("Run 'claude' to log in"))
+                            : (root.isCodex
+                                ? i18n.tr("Run 'codex login' to log in")
+                                : (root.baseUrl
+                                    ? i18n.tr("Check base URL and API key in widget settings")
+                                    : i18n.tr("Run 'claude' to log in")))
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         color: Kirigami.Theme.negativeTextColor
                         wrapMode: Text.WordWrap
@@ -931,10 +1182,14 @@ PlasmoidItem {
                     }
 
                     PlasmaComponents.Button {
-                        text: i18n.tr("Open Claude")
+                        text: root.isCodex ? i18n.tr("Open Codex") : i18n.tr("Open Claude")
                         icon.name: "utilities-terminal"
                         onClicked: {
-                            claudeLauncher.connectSource("bash -c 'cd $HOME && if command -v konsole >/dev/null; then konsole --hold -e env -u CLAUDECODE bash -lc claude; elif command -v gnome-terminal >/dev/null; then gnome-terminal -- env -u CLAUDECODE bash -lc \"claude; exec bash\"; elif command -v xfce4-terminal >/dev/null; then xfce4-terminal --hold -e \"env -u CLAUDECODE bash -lc claude\"; elif command -v xterm >/dev/null; then xterm -hold -e env -u CLAUDECODE bash -lc claude; fi &'")
+                            if (root.isCodex) {
+                                claudeLauncher.connectSource("bash -c 'cd $HOME && if command -v konsole >/dev/null; then konsole --hold -e bash -lc \"codex login\"; elif command -v gnome-terminal >/dev/null; then gnome-terminal -- bash -lc \"codex login; exec bash\"; elif command -v xfce4-terminal >/dev/null; then xfce4-terminal --hold -x bash -lc \"codex login\"; elif command -v xterm >/dev/null; then xterm -hold -e bash -lc \"codex login\"; fi &'")
+                            } else {
+                                claudeLauncher.connectSource("bash -c 'cd $HOME && if command -v konsole >/dev/null; then konsole --hold -e env -u CLAUDECODE bash -lc claude; elif command -v gnome-terminal >/dev/null; then gnome-terminal -- env -u CLAUDECODE bash -lc \"claude; exec bash\"; elif command -v xfce4-terminal >/dev/null; then xfce4-terminal --hold -e \"env -u CLAUDECODE bash -lc claude\"; elif command -v xterm >/dev/null; then xterm -hold -e env -u CLAUDECODE bash -lc claude; fi &'")
+                            }
                         }
                     }
                 }
@@ -1004,6 +1259,35 @@ PlasmoidItem {
                 }
             }
 
+            // Codex rate-limit reached banner (fetch succeeded, but usage is blocked)
+            Rectangle {
+                visible: root.isCodex && root.codexBlocked
+                Layout.fillWidth: true
+                Layout.preferredHeight: blockedColumn.implicitHeight + Kirigami.Units.largeSpacing
+                radius: 5
+                color: Kirigami.Theme.negativeBackgroundColor
+
+                ColumnLayout {
+                    id: blockedColumn
+                    anchors.fill: parent
+                    anchors.margins: Kirigami.Units.smallSpacing
+                    spacing: Kirigami.Units.smallSpacing
+
+                    PlasmaComponents.Label {
+                        text: "⚠ " + i18n.tr("Rate limit reached")
+                        color: Kirigami.Theme.negativeTextColor
+                        font.bold: true
+                    }
+                    PlasmaComponents.Label {
+                        text: i18n.tr("Usage is paused until the window resets")
+                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                        color: Kirigami.Theme.negativeTextColor
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                }
+            }
+
             // Separator
             Rectangle {
                 Layout.fillWidth: true
@@ -1015,6 +1299,7 @@ PlasmoidItem {
             // Session Usage
             ColumnLayout {
                 Layout.fillWidth: true
+                visible: root.sessionAvailable
                 spacing: Kirigami.Units.smallSpacing
 
                 RowLayout {
@@ -1044,6 +1329,19 @@ PlasmoidItem {
                         radius: 5
                         color: getUsageColor(root.sessionUsagePercent)
                     }
+                    // Time-elapsed marker (how far through the window)
+                    Rectangle {
+                        width: 2
+                        height: parent.height
+                        color: Kirigami.Theme.highlightColor
+                        visible: timeElapsedPercent(root.sessionResetTime, root.sessionWindowMs) >= 0
+                        x: {
+                            root.minuteTick  // re-evaluate each minute
+                            var t = timeElapsedPercent(root.sessionResetTime, root.sessionWindowMs)
+                            if (t < 0) return 0
+                            return Math.min(parent.width - 2, parent.width * Math.min(t, 100) / 100)
+                        }
+                    }
                 }
 
                 PlasmaComponents.Label {
@@ -1057,6 +1355,7 @@ PlasmoidItem {
             // Weekly Usage
             ColumnLayout {
                 Layout.fillWidth: true
+                visible: root.weeklyAvailable
                 spacing: Kirigami.Units.smallSpacing
 
                 RowLayout {
@@ -1086,6 +1385,19 @@ PlasmoidItem {
                         radius: 5
                         color: getUsageColor(root.weeklyUsagePercent)
                     }
+                    // Time-elapsed marker (how far through the window)
+                    Rectangle {
+                        width: 2
+                        height: parent.height
+                        color: Kirigami.Theme.highlightColor
+                        visible: timeElapsedPercent(root.weeklyResetTime, root.weeklyWindowMs) >= 0
+                        x: {
+                            root.minuteTick  // re-evaluate each minute
+                            var t = timeElapsedPercent(root.weeklyResetTime, root.weeklyWindowMs)
+                            if (t < 0) return 0
+                            return Math.min(parent.width - 2, parent.width * Math.min(t, 100) / 100)
+                        }
+                    }
                 }
 
                 PlasmaComponents.Label {
@@ -1098,14 +1410,16 @@ PlasmoidItem {
 
             // Separator
             Rectangle {
+                visible: !root.isCodex
                 Layout.fillWidth: true
                 height: 1
                 color: Kirigami.Theme.disabledTextColor
                 opacity: 0.3
             }
 
-            // Model breakdown
+            // Model breakdown (Claude only — Codex has no per-model split)
             PlasmaComponents.Label {
+                visible: !root.isCodex
                 text: i18n.tr("By Model (Weekly)")
                 font.bold: true
                 font.pixelSize: Kirigami.Theme.smallFont.pixelSize
@@ -1120,8 +1434,17 @@ PlasmoidItem {
                     required property var modelData
                     Layout.fillWidth: true
 
+                    // Active-model dot: marks the model currently constraining the weekly limit
+                    Rectangle {
+                        visible: modelRow.modelData.active === true
+                        Layout.preferredWidth: 6
+                        Layout.preferredHeight: 6
+                        radius: 3
+                        color: Kirigami.Theme.highlightColor
+                    }
                     PlasmaComponents.Label {
                         text: modelRow.modelData.name
+                        font.bold: modelRow.modelData.active === true
                     }
                     Item { Layout.fillWidth: true }
                     Rectangle {
@@ -1148,11 +1471,125 @@ PlasmoidItem {
 
             // No model data message
             PlasmaComponents.Label {
-                visible: !root.hasModelData
+                visible: !root.hasModelData && !root.isCodex
                 text: i18n.tr("No model breakdown available")
                 font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                 color: Kirigami.Theme.disabledTextColor
                 font.italic: true
+            }
+
+            // Extra usage — Claude's "spend" pool (dollars that cover you past plan limits)
+            ColumnLayout {
+                visible: !root.isCodex && root.spendInfo !== null
+                Layout.fillWidth: true
+                spacing: Kirigami.Units.smallSpacing
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 1
+                    color: Kirigami.Theme.disabledTextColor
+                    opacity: 0.3
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    PlasmaComponents.Label {
+                        text: i18n.tr("Extra Usage")
+                        font.bold: true
+                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                    }
+                    Item { Layout.fillWidth: true }
+                    PlasmaComponents.Label {
+                        text: root.spendInfo
+                            ? formatMoney(root.spendInfo.usedMinor, root.spendInfo.exponent, root.spendInfo.currency)
+                                + " / " + formatMoney(root.spendInfo.limitMinor, root.spendInfo.exponent, root.spendInfo.currency)
+                            : ""
+                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                        color: Kirigami.Theme.disabledTextColor
+                    }
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 8
+                    radius: 3
+                    color: Kirigami.Theme.backgroundColor
+                    border.color: Kirigami.Theme.disabledTextColor
+                    border.width: 1
+                    Rectangle {
+                        width: parent.width * Math.min((root.spendInfo ? root.spendInfo.percent : 0) / 100, 1)
+                        height: parent.height
+                        radius: 3
+                        color: getUsageColor(root.spendInfo ? root.spendInfo.percent : 0)
+                    }
+                }
+            }
+
+            // Credits — Codex balance, banked rate-limit resets, approx messages remaining
+            ColumnLayout {
+                visible: root.isCodex && root.codexCredits !== null
+                Layout.fillWidth: true
+                spacing: Kirigami.Units.smallSpacing
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 1
+                    color: Kirigami.Theme.disabledTextColor
+                    opacity: 0.3
+                }
+
+                PlasmaComponents.Label {
+                    text: i18n.tr("Credits")
+                    font.bold: true
+                    font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                }
+
+                RowLayout {
+                    visible: root.codexCredits && (root.codexCredits.unlimited || root.codexCredits.balance !== null)
+                    Layout.fillWidth: true
+                    PlasmaComponents.Label { text: i18n.tr("Balance") }
+                    Item { Layout.fillWidth: true }
+                    PlasmaComponents.Label {
+                        text: !root.codexCredits ? ""
+                            : (root.codexCredits.unlimited
+                                ? i18n.tr("Unlimited")
+                                : formatMoney(Math.round(root.codexCredits.balance * 100), 2, "USD"))
+                        font.bold: true
+                    }
+                }
+
+                RowLayout {
+                    visible: root.codexCredits && root.codexCredits.resetCredits > 0
+                    Layout.fillWidth: true
+                    PlasmaComponents.Label { text: i18n.tr("Reset credits") }
+                    Item { Layout.fillWidth: true }
+                    PlasmaComponents.Label {
+                        text: root.codexCredits ? "" + root.codexCredits.resetCredits : "0"
+                        font.bold: true
+                    }
+                }
+
+                RowLayout {
+                    visible: root.codexCredits && root.codexCredits.localMsg
+                    Layout.fillWidth: true
+                    PlasmaComponents.Label { text: i18n.tr("Local messages") }
+                    Item { Layout.fillWidth: true }
+                    PlasmaComponents.Label {
+                        text: root.codexCredits ? formatMsgRange(root.codexCredits.localMsg) : ""
+                        color: Kirigami.Theme.disabledTextColor
+                    }
+                }
+
+                RowLayout {
+                    visible: root.codexCredits && root.codexCredits.cloudMsg
+                    Layout.fillWidth: true
+                    PlasmaComponents.Label { text: i18n.tr("Cloud messages") }
+                    Item { Layout.fillWidth: true }
+                    PlasmaComponents.Label {
+                        text: root.codexCredits ? formatMsgRange(root.codexCredits.cloudMsg) : ""
+                        color: Kirigami.Theme.disabledTextColor
+                    }
+                }
             }
 
             // Rate limit warning
@@ -1255,7 +1692,9 @@ PlasmoidItem {
         }
     }
 
-    function drawCircularProgress(ctx, w, h, percent) {
+    // Draws the usage arc (outer) and, when timePercent >= 0, a thinner inner arc
+    // showing how far through the current window we are. timePercent < 0 skips it.
+    function drawCircularProgress(ctx, w, h, percent, timePercent) {
         var centerX = w / 2
         var centerY = h / 2
         var radius = Math.min(w, h) / 2 - 2
@@ -1283,6 +1722,76 @@ PlasmoidItem {
             ctx.lineCap = "round"
             ctx.stroke()
         }
+
+        // Inner "time elapsed" ring
+        if (timePercent >= 0) {
+            var innerLineWidth = 2
+            var innerRadius = radius - lineWidth - 1.5
+            if (innerRadius > 1) {
+                var innerEnd = startAngle + (2 * Math.PI * Math.min(timePercent, 100) / 100)
+                ctx.beginPath()
+                ctx.arc(centerX, centerY, innerRadius, 0, 2 * Math.PI)
+                ctx.strokeStyle = Kirigami.Theme.highlightColor
+                ctx.globalAlpha = 0.2
+                ctx.lineWidth = innerLineWidth
+                ctx.stroke()
+
+                if (timePercent > 0) {
+                    ctx.beginPath()
+                    ctx.arc(centerX, centerY, innerRadius, startAngle, innerEnd)
+                    ctx.strokeStyle = Kirigami.Theme.highlightColor
+                    ctx.globalAlpha = 0.9
+                    ctx.lineWidth = innerLineWidth
+                    ctx.lineCap = "round"
+                    ctx.stroke()
+                }
+            }
+        }
+    }
+
+    // Fraction (0..100) of the current window that has elapsed, given its reset time
+    // and length. Returns -1 when it can't be computed (no reset time / no length),
+    // which callers use to skip drawing the inner ring/marker.
+    function timeElapsedPercent(resetTime, windowMs) {
+        if (!resetTime || !windowMs || windowMs <= 0) return -1
+        var remaining = resetTime.getTime() - Date.now()
+        if (remaining <= 0) return 100
+        var elapsed = windowMs - remaining
+        if (elapsed < 0) elapsed = 0  // window longer than assumed / clock skew
+        return Math.min(100, elapsed / windowMs * 100)
+    }
+
+    // Format a minor-unit money amount (e.g. cents) with a currency symbol.
+    function formatMoney(minor, exponent, currency) {
+        var div = Math.pow(10, exponent || 0)
+        var value = (minor || 0) / div
+        var symbols = { "USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥" }
+        var sym = symbols[currency] || ""
+        var text = value.toFixed(exponent > 0 ? exponent : 0)
+        return sym ? sym + text : text + " " + (currency || "")
+    }
+
+    // Format a Codex [low, high] approx-messages range as "~N" or "~lo–hi".
+    function formatMsgRange(arr) {
+        if (!arr || arr.length < 1) return ""
+        var lo = arr[0]
+        var hi = arr.length > 1 ? arr[1] : arr[0]
+        return lo === hi ? "~" + lo : "~" + lo + "–" + hi
+    }
+
+    // Codex plan_type -> display label.
+    function codexPlanName(planType) {
+        if (!planType) return "Codex"
+        var map = {
+            "free": "Free",
+            "plus": "Plus",
+            "pro": "Pro",
+            "business": "Business",
+            "team": "Team",
+            "enterprise": "Enterprise",
+            "edu": "Edu"
+        }
+        return map[planType] || (planType.charAt(0).toUpperCase() + planType.slice(1))
     }
 
     function getUsageColor(percent) {
@@ -1330,6 +1839,26 @@ PlasmoidItem {
             console.log("Claude Usage: Base folder changed, reloading")
             refresh()
         }
+        function onCodexBaseFolderChanged() {
+            console.log("Claude Usage: Codex folder changed, reloading")
+            refresh()
+        }
+        function onProviderChanged() {
+            console.log("Claude Usage: Provider changed, reloading")
+            // Reset window/availability so stale Claude data doesn't bleed into Codex view
+            root.modelUsages = []
+            root.spendInfo = null
+            root.codexCredits = null
+            root.codexBlocked = false
+            root.sessionAvailable = true
+            root.weeklyAvailable = true
+            root.sessionWindowMs = root.defaultSessionWindowMs
+            root.weeklyWindowMs = root.defaultWeeklyWindowMs
+            root.sessionResetTime = null
+            root.weeklyResetTime = null
+            cacheReader.connectSource("cat " + root.cacheFilePath + " 2>/dev/null")
+            refresh()
+        }
     }
 
     // Install icon to system theme for about page
@@ -1366,12 +1895,12 @@ PlasmoidItem {
     }
 
     Plasmoid.icon: "claude-usage-widget"
-    toolTipMainText: i18n.tr("Claude Usage")
+    toolTipMainText: root.isCodex ? i18n.tr("Codex Usage") : i18n.tr("Claude Usage")
     toolTipSubText: {
         var parts = []
-        if (Plasmoid.configuration.showSession !== false)
+        if (Plasmoid.configuration.showSession !== false && root.sessionAvailable)
             parts.push(i18n.tr("Session (5hr)") + ": " + Math.round(root.sessionUsagePercent) + "%")
-        if (Plasmoid.configuration.showWeekly !== false)
+        if (Plasmoid.configuration.showWeekly !== false && root.weeklyAvailable)
             parts.push(i18n.tr("Weekly (7day)") + ": " + Math.round(root.weeklyUsagePercent) + "%")
         for (var i = 0; i < root.modelUsages.length; i++)
             parts.push(root.modelUsages[i].name + ": " + Math.round(root.modelUsages[i].percent) + "%")
